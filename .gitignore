@@ -1,0 +1,31 @@
+## .NET / Visual Studio
+bin/
+obj/
+.vs/
+TestResults/
+
+## User-specific files
+*.user
+*.rsuser
+*.suo
+*.userosscache
+*.sln.docstates
+
+## Build outputs
+*.dll
+*.exe
+*.pdb
+*.cache
+*.log
+
+## Rider / ReSharper
+.idea/
+_ReSharper*/
+*.DotSettings.user
+
+## OS
+Thumbs.db
+Desktop.ini
+
+## Project-specific
+OriginHex.Bin

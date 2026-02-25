@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -13,9 +13,39 @@ namespace ECanTest.HEX
         {
             string[] lines = File.ReadAllLines(file);
             IList<HEXLine> rLines = new List<HEXLine>();
-            lines.ToList().ForEach((s) => {
-                rLines.Add(new HEXLine(s));
-            });
+            uint linearBase = 0;
+            uint segmentBase = 0;
+            bool useSegmentBase = false;
+            for (int i = 0; i < lines.Length; i++)
+            {
+                var raw = lines[i];
+                if (string.IsNullOrWhiteSpace(raw)) continue;
+                HEXLine parsed;
+                try
+                {
+                    parsed = new HEXLine(raw, i + 1);
+                }
+                catch (Exception ex)
+                {
+                    throw new Exception($"hex parse error at line {i + 1}: {ex.Message}");
+                }
+
+                if (parsed.DataType == DataType.ExtendSegmentAddressRecord)
+                {
+                    segmentBase = (uint)((parsed.data[0] << 8) | parsed.data[1]) << 4;
+                    useSegmentBase = true;
+                }
+                else if (parsed.DataType == DataType.ExtendedLinearAddressRecord)
+                {
+                    linearBase = (uint)((parsed.data[0] << 8) | parsed.data[1]) << 16;
+                    useSegmentBase = false;
+                }
+                else if (parsed.DataType == DataType.DataRecord)
+                {
+                    parsed.Address = (useSegmentBase ? segmentBase : linearBase) + parsed.Address;
+                }
+                rLines.Add(parsed);
+            }
             if (rLines.Count == 0)
             {
                 throw new Exception("File is empty or have not access privilege");
@@ -27,11 +57,25 @@ namespace ECanTest.HEX
             }
 #if DEBUG
             var fs = File.Open("OriginHex.Bin", FileMode.Create);
-            foreach (var item in rLines)
+            var dataLines = rLines.Where(s => s.DataType == DataType.DataRecord).OrderBy(s => s.Address).ToList();
+            if (dataLines.Count > 0)
             {
-                if (item.DataType == DataType.DataRecord)
+                uint cursor = dataLines[0].Address;
+                foreach (var item in dataLines)
                 {
+                    if (item.Address > cursor)
+                    {
+                        var gap = item.Address - cursor;
+                        if (gap > 0)
+                        {
+                            var fill = Enumerable.Repeat((byte)0xFF, (int)Math.Min(gap, int.MaxValue)).ToArray();
+                            fs.Write(fill, 0, fill.Length);
+                            cursor += (uint)fill.Length;
+                            if (cursor != item.Address) break;
+                        }
+                    }
                     fs.Write(item.data, 0, item.data.Length);
+                    cursor = item.Address + item.DataLength;
                 }
             }
             fs.Flush();
@@ -42,6 +86,13 @@ namespace ECanTest.HEX
         }
         public static void SortLines(ref IList<HEXLine> lines,string[] rawLines,int blockSize=512)
         {
+            var rawLineIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+            for (int i = 0; i < rawLines.Length; i++)
+            {
+                var s = rawLines[i];
+                if (!rawLineIndex.ContainsKey(s)) rawLineIndex.Add(s, i);
+            }
+
             for (int i = 0; i < lines.Count; i++)
             {
                 var line = lines[i];
@@ -57,7 +108,8 @@ namespace ECanTest.HEX
                             Address = line.Address + (line.DataLength - _overSize),
                             DataLength = _overSize,
                             data = line.data.Skip((int)(line.DataLength - _overSize)).Take((int)_overSize).ToArray(),
-                            DataType = DataType.DataRecord
+                            DataType = DataType.DataRecord,
+                            RAW = "<generated>"
                         };
                         if (i + 1 >= lines.Count)
                         {
@@ -91,29 +143,32 @@ namespace ECanTest.HEX
             {
                 var line = lines[i];
                 if (line.DataType != DataType.DataRecord) continue;
-                var rest = line.Address % 8;
-                if (rest != 0)
+                var misalignment = line.Address % 8;
+                if (misalignment != 0)
                 {
+                    var bytesToMove = 8 - misalignment;
                     //i>0才能保证i-1不为负，否则索引越界
                     if(i>0 && lines[i-1].DataType == DataType.DataRecord )
                     {
                         if(line.Address < lines[i-1].Address + lines[i - 1].DataLength)
                         {
-                            int k = rawLines.ToList().IndexOf(lines[i].RAW);
+                            int k = -1;
+                            if (!string.IsNullOrEmpty(lines[i].RAW) && rawLineIndex.TryGetValue(lines[i].RAW, out var idx)) k = idx;
                             throw new Exception("can not process the hex file,line:" + (k == -1 ? i : k));
                         }
                         if((lines[i - 1].Address + lines[i - 1].DataLength == line.Address))
                         {
-                            lines[i - 1].data = lines[i - 1].data.Concat(line.data.Take((int)rest)).ToArray();
-                            lines[i - 1].DataLength += rest;
-                            line.data = line.data.Skip((int)rest).ToArray();
-                            line.DataLength -= rest;
-                            line.Address += rest;
+                            var moveCount = (uint)Math.Min((long)bytesToMove, (long)line.DataLength);
+                            lines[i - 1].data = lines[i - 1].data.Concat(line.data.Take((int)moveCount)).ToArray();
+                            lines[i - 1].DataLength += moveCount;
+                            line.data = line.data.Skip((int)moveCount).ToArray();
+                            line.DataLength -= moveCount;
+                            line.Address += moveCount;
                         }
                         else if(line.Address > lines[i - 1].Address + lines[i - 1].DataLength)
                         {
                             //地址如果不比上一行大，是有问题的，无法处理
-                            if (line.Address - rest < lines[i - 1].Address + lines[i - 1].DataLength)
+                            if (line.Address >= bytesToMove && line.Address - bytesToMove < lines[i - 1].Address + lines[i - 1].DataLength)
                             {
                                 //地址比上一行末尾大，并且向后退rest字节后，还落入上一行的空间内，那么再两行之间填补FF
                                 List<byte> _toFill = new List<byte>();
@@ -125,19 +180,20 @@ namespace ECanTest.HEX
                                 lines[i - 1].DataLength += k;
                                 lines[i - 1].data = lines[i - 1].data.Concat(_toFill).ToArray();
                                 //在上一行补完ff后，两行数据应该能连起来，然后再开始把本行多出来的数据移到上一行
-                                lines[i - 1].data = lines[i - 1].data.Concat(line.data.Take((int)rest)).ToArray();
-                                lines[i - 1].DataLength += rest;
-                                line.data = line.data.Skip((int)rest).ToArray();
-                                line.DataLength -= rest;
-                                line.Address += rest;
+                                var moveCount = (uint)Math.Min((long)bytesToMove, (long)line.DataLength);
+                                lines[i - 1].data = lines[i - 1].data.Concat(line.data.Take((int)moveCount)).ToArray();
+                                lines[i - 1].DataLength += moveCount;
+                                line.data = line.data.Skip((int)moveCount).ToArray();
+                                line.DataLength -= moveCount;
+                                line.Address += moveCount;
                             }
                             else
                             {
                                 //否则直接在本行前补FF，并退回rest数量的地址
-                                line.Address -= rest;
-                                line.DataLength += rest;
+                                line.Address -= misalignment;
+                                line.DataLength += misalignment;
                                 List<byte> _toFill = new List<byte>();
-                                for (uint j = 0; j < rest; j++)
+                                for (uint j = 0; j < misalignment; j++)
                                 {
                                     _toFill.Add(0xff);
                                 }
@@ -147,12 +203,18 @@ namespace ECanTest.HEX
                     }
                     else
                     {
-                        int k = rawLines.ToList().IndexOf(lines[i].RAW);
-                        throw new Exception("can not process the hex file,line:" + (k == -1 ? i : k));
+                        line.Address -= misalignment;
+                        line.DataLength += misalignment;
+                        List<byte> _toFill = new List<byte>();
+                        for (uint j = 0; j < misalignment; j++)
+                        {
+                            _toFill.Add(0xff);
+                        }
+                        line.data = _toFill.Concat(line.data).ToArray();
                     }
                 }
             }
-            lines = lines.Where(s => s.DataLength != 0).ToList();
+            lines = lines.Where(s => s.DataType != DataType.DataRecord || s.DataLength != 0).ToList();
 
         }
     }
